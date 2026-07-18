@@ -708,6 +708,49 @@ pub fn get_active_userid() -> String {
     get_active_user("-n")
 }
 
+/// Return every UID with a login-window/session entry. Fast user switching
+/// can leave several GUI bootstrap domains alive at once, so updating only
+/// the console user can leave another user's agent on the old bundle.
+fn get_logged_in_uids() -> Vec<String> {
+    let mut uids = std::collections::BTreeSet::new();
+    if let Ok(output) = std::process::Command::new("/usr/bin/who").output() {
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let Some(username) = line.split_whitespace().next() else {
+                continue;
+            };
+            let Ok(output) = std::process::Command::new("/usr/bin/id")
+                .args(["-u", username])
+                .output()
+            else {
+                continue;
+            };
+            let uid = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            let gui_domain = format!("gui/{}", uid);
+            if !uid.is_empty()
+                && uid.bytes().all(|byte| byte.is_ascii_digit())
+                && std::process::Command::new("/bin/launchctl")
+                    .args(["print", &gui_domain])
+                    .output()
+                    .is_ok_and(|output| output.status.success())
+            {
+                uids.insert(uid);
+            }
+        }
+    }
+    let active_uid = get_active_userid();
+    if !active_uid.is_empty()
+        && active_uid.bytes().all(|byte| byte.is_ascii_digit())
+        && active_uid != "0"
+    {
+        uids.insert(active_uid);
+    }
+    if uids.is_empty() {
+        // The login window has no ordinary gui/0 bootstrap domain.
+        uids.insert("0".to_owned());
+    }
+    uids.into_iter().collect()
+}
+
 pub fn get_active_user_home() -> Option<PathBuf> {
     let username = get_active_username();
     if !username.is_empty() {
@@ -1120,13 +1163,10 @@ pub fn update_from_dmg_as_root(dmg_path: &str) -> ResultType<()> {
         bail!("[root-update] Active session detected after extraction, deferring update.");
     }
 
-    // Get user ID for launchctl commands
-    let uid = get_active_userid();
-    let uid = if uid.bytes().all(|byte| byte.is_ascii_digit()) {
-        uid
-    } else {
-        String::new()
-    };
+    let logged_in_uids = get_logged_in_uids();
+    // UIDs are validated as decimal digits before embedding in the
+    // root-run shell script, so they cannot alter its command structure.
+    let uid_list = logged_in_uids.join(" ");
 
     // Write a shell script that runs detached after this function returns.
     // We cannot directly replace /Applications/RustDesk.app while it is running,
@@ -1139,9 +1179,10 @@ pub fn update_from_dmg_as_root(dmg_path: &str) -> ResultType<()> {
 sleep 3
 rollback_done=0
 bootstrap_agent() {{
-    if [ -n "{uid}" ] && [ "{uid}" != "0" ]; then
-        launchctl bootstrap gui/{uid} "{agent_plist}" 2>/dev/null || \
-            launchctl bootstrap user/{uid} "{agent_plist}" 2>/dev/null || \
+    agent_uid="$1"
+    if [ "$agent_uid" != "0" ]; then
+        launchctl bootstrap gui/"$agent_uid" "{agent_plist}" 2>/dev/null || \
+            launchctl bootstrap user/"$agent_uid" "{agent_plist}" 2>/dev/null || \
             launchctl load -w "{agent_plist}" 2>/dev/null
     else
         # At the login window there is no gui/0 domain.  launchctl load uses
@@ -1149,12 +1190,20 @@ bootstrap_agent() {{
         launchctl load -w "{agent_plist}" 2>/dev/null
     fi
 }}
+bootstrap_agents() {{
+    for agent_uid in {uid_list}; do
+        bootstrap_agent "$agent_uid" || return 1
+    done
+}}
 agent_ready() {{
-    if [ -z "{uid}" ] || [ "{uid}" = "0" ]; then
-        return 0
-    fi
-    launchctl print gui/{uid}/{agent_label} >/dev/null 2>&1 || \
-        launchctl print user/{uid}/{agent_label} >/dev/null 2>&1
+    for agent_uid in {uid_list}; do
+        if [ "$agent_uid" != "0" ] && \
+           ! launchctl print gui/"$agent_uid"/{agent_label} >/dev/null 2>&1 && \
+           ! launchctl print user/"$agent_uid"/{agent_label} >/dev/null 2>&1; then
+            return 1
+        fi
+    done
+    return 0
 }}
 write_new_plists() {{
     /Applications/{app_name}.app/Contents/MacOS/service --write-plists \
@@ -1191,32 +1240,47 @@ rollback_plists() {{
        ! launchctl bootstrap system "{daemon_plist}" 2>/dev/null; then
         restore_failed=1
     fi
-    bootstrap_agent || restore_failed=1
+    bootstrap_agents || restore_failed=1
     if [ "$restore_failed" -ne 0 ]; then
         echo "[root-update] CRITICAL: rollback restoration failed" >> {tmp_dir}/rustdesk_root_update.log
         touch /var/root/.rustdeskupdate_failed
     fi
 }}
 trap rollback_plists EXIT
-# Check if the GUI was open before we kill it
-gui_was_running=$(pgrep -x {app_name} | xargs -I{{}} ps -p {{}} -o args= 2>/dev/null | grep -vc "server\|service\|update" || true)
+gui_uids=""
+for agent_uid in {uid_list}; do
+    for pid in $(pgrep -u "$agent_uid" -x {app_name} || true); do
+        process_args=$(ps -p "$pid" -o args= 2>/dev/null || true)
+        if printf '%s\n' "$process_args" | grep -F "/Applications/{app_name}.app/" >/dev/null && \
+           ! printf '%s\n' "$process_args" | grep -E "(^|[[:space:]])(--server|--service|--update)([[:space:]]|$)" >/dev/null; then
+            gui_uids="$gui_uids $agent_uid"
+            break
+        fi
+    done
+done
 if ! launchctl bootout system/{daemon_label} 2>/dev/null && \
    ! launchctl unload -w {daemon_plist} 2>/dev/null; then
     touch /var/root/.rustdeskupdate_failed
     exit 1
 fi
-if [ -n "{uid}" ] && [ "{uid}" != "0" ]; then
-    launchctl bootout gui/{uid}/{agent_label} 2>/dev/null || launchctl unload -w {agent_plist} 2>/dev/null || true
-else
-    launchctl unload -w "{agent_plist}" 2>/dev/null || true
-fi
+for agent_uid in {uid_list}; do
+    if [ "$agent_uid" != "0" ]; then
+        launchctl bootout gui/"$agent_uid"/{agent_label} 2>/dev/null || \
+            launchctl bootout user/"$agent_uid"/{agent_label} 2>/dev/null || true
+    else
+        launchctl unload -w "{agent_plist}" 2>/dev/null || true
+    fi
+done
 sleep 1
 # Terminate only processes whose command line points into the RustDesk bundle;
 # avoid broad name/regex-based pkill patterns.
-for pid in $(pgrep -x {app_name} || true); do
-    if ps -p "$pid" -o args= 2>/dev/null | grep -F "/Applications/{app_name}.app/" >/dev/null; then
-        kill -9 "$pid" 2>/dev/null || true
-    fi
+for agent_uid in {uid_list}; do
+    for pid in $(pgrep -u "$agent_uid" -x {app_name} || true); do
+        process_args=$(ps -p "$pid" -o args= 2>/dev/null || true)
+        if printf '%s\n' "$process_args" | grep -F "/Applications/{app_name}.app/" >/dev/null; then
+            kill -9 "$pid" 2>/dev/null || true
+        fi
+    done
 done
 sleep 2
 staged_bundle="{tmp_dir}/staged.app"
@@ -1232,7 +1296,7 @@ if ! ditto {src_app} "$staged_bundle" 2>/dev/null; then
     launchctl load -w {daemon_plist} 2>/dev/null || \
         launchctl bootstrap system {daemon_plist} 2>/dev/null || \
         echo "[root-update] WARNING: failed to reload daemon after ditto failure" >> /var/root/.rustdeskupdate_failed
-    bootstrap_agent || true
+    bootstrap_agents || true
     exit 1
 fi
 # Validate staged bundle before atomic swap
@@ -1245,7 +1309,7 @@ if [ ! -d "$staged_bundle/Contents/MacOS" ] || \
     rm -rf "$staged_bundle"
     launchctl load -w {daemon_plist} 2>/dev/null || \
         launchctl bootstrap system {daemon_plist} 2>/dev/null || true
-    bootstrap_agent || true
+    bootstrap_agents || true
     exit 1
 fi
 if ! mv {app_bundle} {app_bundle}.bak; then
@@ -1253,7 +1317,7 @@ if ! mv {app_bundle} {app_bundle}.bak; then
     touch /var/root/.rustdeskupdate_failed
     rm -rf "$staged_bundle"
     launchctl load -w {daemon_plist} 2>/dev/null || launchctl bootstrap system {daemon_plist} 2>/dev/null || true
-    bootstrap_agent || true
+    bootstrap_agents || true
     exit 1
 fi
 if ! mv "$staged_bundle" {app_bundle}; then
@@ -1263,7 +1327,7 @@ if ! mv "$staged_bundle" {app_bundle}; then
     fi
     touch /var/root/.rustdeskupdate_failed
     launchctl load -w {daemon_plist} 2>/dev/null || launchctl bootstrap system {daemon_plist} 2>/dev/null || true
-    bootstrap_agent || true
+    bootstrap_agents || true
     exit 1
 fi
 # Install the entire bundle as root-owned.  The LaunchDaemon executes code
@@ -1278,7 +1342,7 @@ if ! chown -R root:wheel {app_bundle} || ! chmod -R go-w {app_bundle}; then
     fi
     touch /var/root/.rustdeskupdate_failed
     launchctl load -w {daemon_plist} 2>/dev/null || launchctl bootstrap system {daemon_plist} 2>/dev/null || true
-    bootstrap_agent || true
+    bootstrap_agents || true
     exit 1
 fi
 xattr -r -d com.apple.quarantine {app_bundle} || true
@@ -1301,7 +1365,7 @@ if ! chown root:wheel {app_bundle} || \
     fi
     touch /var/root/.rustdeskupdate_failed
     launchctl load -w {daemon_plist} 2>/dev/null || launchctl bootstrap system {daemon_plist} 2>/dev/null || true
-    bootstrap_agent || true
+    bootstrap_agents || true
     exit 1
 fi
 # Generate launchd definitions from the new, final-location binary.  The
@@ -1367,7 +1431,7 @@ if [ "$daemon_ready" -ne 1 ]; then
 fi
 # Bootstrap agent BEFORE removing backup — needed for rollback on failure.
 # This also uses launchctl load for the login-window/no-console-user case.
-if ! bootstrap_agent || ! agent_ready; then
+if ! bootstrap_agents || ! agent_ready; then
         echo "[root-update] CRITICAL: agent bootstrap failed, rolling back" >> {tmp_dir}/rustdesk_root_update.log
         launchctl bootout system/{daemon_label} 2>/dev/null || true
         mv {app_bundle} "{failed_install}" 2>/dev/null || true
@@ -1379,7 +1443,7 @@ if ! bootstrap_agent || ! agent_ready; then
         cp {agent_plist_bak} {agent_plist} 2>/dev/null || true
         launchctl load -w {daemon_plist} 2>/dev/null || \
             launchctl bootstrap system {daemon_plist} 2>/dev/null || true
-        bootstrap_agent || true
+        bootstrap_agents || true
         touch /var/root/.rustdeskupdate_failed
         exit 1
 fi
@@ -1402,16 +1466,16 @@ fi
 # Only remove backup after BOTH daemon AND agent confirmed running
 rollback_done=1
 rm -rf {app_bundle}.bak
-if [ "$gui_was_running" -gt "0" ] && [ -n "{uid}" ]; then
-    launchctl asuser {uid} open -a "{app_bundle}" || true
-fi
+for gui_uid in $gui_uids; do
+    launchctl asuser "$gui_uid" open -a "{app_bundle}" || true
+done
 echo "[root-update] Done!" >> {tmp_dir}/rustdesk_root_update.log
 rm -rf {tmp_dir}
 "#,
         app_name = app_name,
         app_bundle = app_bundle,
         src_app = src_app,
-        uid = uid,
+        uid_list = uid_list,
         daemon_plist = daemon_plist,
         agent_plist = agent_plist,
         tmp_dir = tmp_dir,
